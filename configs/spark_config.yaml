@@ -1,0 +1,5 @@
+# Spark session configurations
+spark:
+  app_name: "TransitGridPipeline"
+  executor_memory: "2g"
+  driver_memory: "2g"
