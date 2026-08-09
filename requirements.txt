@@ -1,3 +1,10 @@
 pyspark
 pymongo
 psycopg2-binary
+azure-storage-blob
+python-dotenv
+pyyaml
+pandas
+sqlalchemy
+pyarrow
+fastparquet

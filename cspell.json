@@ -1,0 +1,9 @@
+{
+    "version": "0.2",
+    "language": "en",
+    "ignorePaths": [
+        "readme.txt",
+        "requirements.txt",
+        "src/processing/spark_transform.py"
+    ]
+}

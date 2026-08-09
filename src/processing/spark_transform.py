@@ -1,0 +1,274 @@
+import os
+import yaml
+from dotenv import load_dotenv
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType, LongType
+
+
+# 1. Loaded the environment & config
+
+load_dotenv()
+
+_config_path = os.path.join(
+    os.path.dirname(__file__), "..", "..", "configs", "spark_config.yaml"
+)
+with open(_config_path, "r") as _f:
+    _cfg = yaml.safe_load(_f)
+
+AZURE_CONN_STR   = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+RAW_CONTAINER    = "raw-transit"
+PROC_CONTAINER   = "processed-transit"
+
+
+# 2. Build Spark session
+
+def get_spark(account_name: str, account_key: str) -> SparkSession:
+    """Creates and returns a configured SparkSession with Azure credentials."""
+    spark_cfg = _cfg.get("spark", {})
+    return (
+        SparkSession.builder
+        .appName(spark_cfg.get("app_name", "TransitGridPipeline"))
+        .config("spark.jars.packages", "org.apache.hadoop:hadoop-azure:3.3.4,com.microsoft.azure:azure-storage:8.6.6")
+        .config("spark.executor.memory", spark_cfg.get("executor_memory", "2g"))
+        .config("spark.driver.memory",   spark_cfg.get("driver_memory",   "2g"))
+        # Inject Azure storage account credentials so hadoop-azure can authenticate
+        .config(f"spark.hadoop.fs.azure.account.key.{account_name}.blob.core.windows.net", account_key)
+        # Use commit algorithm v2: writes tasks directly to destination, avoids
+        # the copy-then-rename that fails on wasbs:// (StorageException)
+        .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2")
+        .getOrCreate()
+    )
+
+
+# 3. Read raw JSON blobs from Azure
+
+def read_raw_json(spark: SparkSession, path: str):
+    """
+    Reads all raw GTFS-RT JSON files from the Azure Blob path.
+
+    Args:
+        spark: Active SparkSession.
+        path:  abfss:// or wasbs:// path pointing to the raw container.
+
+    Returns:
+        DataFrame with the raw nested JSON structure.
+    """
+    return spark.read.option("multiLine", True).json(path)
+
+
+
+# 4. Flatten & clean the GTFS-RT nested structure
+
+def _has_nested_field(schema, dot_path: str) -> bool:
+    """
+    Checks whether a dot-separated field path exists in a PySpark schema.
+    Handles both StructType and ArrayType transparently.
+    """
+    from pyspark.sql.types import StructType, ArrayType
+    current = schema
+    for part in dot_path.split("."):
+        if isinstance(current, ArrayType):
+            current = current.elementType
+        if not isinstance(current, StructType):
+            return False
+        names = {f.name for f in current.fields}
+        if part not in names:
+            return False
+        current = current[part].dataType
+    return True
+
+
+def flatten_transit_data(raw_df):
+    """
+    Flattens the GTFS-RT FeedMessage structure, extracts key vehicle fields,
+    and cleans timestamps. All optional GTFS-RT fields are guarded with
+    schema introspection so the pipeline works with any feed variant.
+
+    GTFS-RT optional fields handled gracefully (null if absent):
+        position.speed, vehicle.label
+
+    Returns:
+        Flat DataFrame with one row per vehicle entity.
+    """
+    # Explode the entity array so we get one row per vehicle report
+    exploded = raw_df.select(
+        F.col("header.timestamp").alias("feed_timestamp"),
+        F.explode("entity").alias("entity"),
+    )
+
+    # --- Guard every optional GTFS-RT field against missing schema fields ---
+    schema = exploded.schema
+
+    def _opt(path, dtype):
+        """Return column cast to dtype, or null literal if path is absent in schema."""
+        return (
+            F.col(path).cast(dtype)
+            if _has_nested_field(schema, path)
+            else F.lit(None).cast(dtype)
+        )
+
+    def _opt_str(path):
+        """Return string column, or null literal if path is absent in schema."""
+        from pyspark.sql.types import StringType
+        return (
+            F.col(path)
+            if _has_nested_field(schema, path)
+            else F.lit(None).cast(StringType())
+        )
+
+    # Flatten nested structs into individual columns
+    flat = exploded.select(
+        F.col("feed_timestamp").cast(LongType()),
+        F.col("entity.id").alias("entity_id"),
+
+        # Trip info (all optional in GTFS-RT spec)
+        _opt_str("entity.vehicle.trip.tripId").alias("trip_id"),
+        _opt_str("entity.vehicle.trip.routeId").alias("route_id"),
+        _opt_str("entity.vehicle.trip.startTime").alias("start_time_raw"),
+        _opt_str("entity.vehicle.trip.startDate").alias("start_date"),
+
+        # Position info
+        _opt("entity.vehicle.position.latitude",  DoubleType()).alias("latitude"),
+        _opt("entity.vehicle.position.longitude", DoubleType()).alias("longitude"),
+        _opt("entity.vehicle.position.bearing",   DoubleType()).alias("bearing"),
+        _opt("entity.vehicle.position.speed",     DoubleType()).alias("speed_mps"),
+
+        # Vehicle metadata
+        _opt_str("entity.vehicle.vehicle.id").alias("vehicle_id"),
+        _opt_str("entity.vehicle.vehicle.label").alias("vehicle_label"),
+        _opt_str("entity.vehicle.currentStatus").alias("current_status"),
+        _opt("entity.vehicle.timestamp", LongType()).alias("vehicle_timestamp"),
+    )
+
+    # Derive human-readable timestamps from Unix epoch seconds
+    clean = flat.withColumn(
+        "vehicle_datetime",
+        F.to_timestamp(F.col("vehicle_timestamp"))
+    ).withColumn(
+        "feed_datetime",
+        F.to_timestamp(F.col("feed_timestamp"))
+    ).withColumn(
+        # Convert speed m/s → km/h (null if feed omits speed)
+        "speed_kmh",
+        F.round(F.col("speed_mps") * 3.6, 2)
+    ).drop("speed_mps")
+
+    return clean
+
+
+
+# 5. Write transformed data — local Parquet then upload to Azure
+
+def write_processed_local(df, local_path: str, mode: str = "append"):
+    """
+    Writes the transformed DataFrame to a local Parquet directory,
+    partitioned by start_date.
+
+    wasbs:// write is avoided because the NativeAzureFileSystem commit
+    protocol fails on Windows when cleaning up _temporary dirs.
+    Use upload_to_azure() after this call to push files to Azure.
+
+    Args:
+        df:         Flat, cleaned DataFrame.
+        local_path: Local filesystem output directory.
+        mode:       Spark write mode ('append' or 'overwrite').
+    """
+    os.makedirs(local_path, exist_ok=True)
+    (
+        df.write
+        .mode(mode)
+        .partitionBy("start_date")
+        .parquet(local_path)
+    )
+    print(f" Parquet written locally to: {local_path}")
+
+
+def upload_to_azure(local_path: str, conn_str: str, container: str, prefix: str = "vehicles"):
+    """
+    Uploads all Parquet files from a local directory tree to Azure Blob Storage.
+
+    Args:
+        local_path: Root of the local Parquet output.
+        conn_str:   Azure storage connection string.
+        container:  Target container name.
+        prefix:     Blob name prefix (virtual folder inside the container).
+    """
+    from azure.storage.blob import BlobServiceClient
+    client = BlobServiceClient.from_connection_string(conn_str)
+    container_client = client.get_container_client(container)
+
+    uploaded = 0
+    for root, _, files in os.walk(local_path):
+        for fname in files:
+            if not fname.endswith(".parquet") and fname != "_SUCCESS":
+                continue
+            full_path = os.path.join(root, fname)
+            # Preserve the partition folder structure inside the blob prefix
+            relative  = os.path.relpath(full_path, local_path).replace("\\", "/")
+            blob_name = f"{prefix}/{relative}"
+            with open(full_path, "rb") as f:
+                container_client.upload_blob(blob_name, f, overwrite=True)
+            uploaded += 1
+
+    print(f" Uploaded {uploaded} file(s) to Azure container '{container}/{prefix}'")
+
+
+
+# 6. Main ETL entrypoint
+
+def run_transform(raw_path: str, local_out: str, conn_str: str,
+                  account_name: str, account_key: str):
+    """
+    Full ETL pipeline:
+        raw Azure JSON  ->  flatten / clean  ->  local Parquet  ->  Azure upload.
+
+    Args:
+        raw_path:     wasbs:// path to the raw-transit container.
+        local_out:    Local directory to write intermediate Parquet files.
+        conn_str:     Azure storage connection string (for SDK upload).
+        account_name: Azure storage account name (for Spark read auth).
+        account_key:  Azure storage account key  (for Spark read auth).
+    """
+    spark = get_spark(account_name, account_key)
+    print(f"Reading raw data from: {raw_path}")
+    raw_df = read_raw_json(spark, raw_path)
+
+    print("Flattening GTFS-RT vehicle records...")
+    clean_df = flatten_transit_data(raw_df)
+    clean_df.printSchema()
+
+    record_count = clean_df.count()
+    print(f" {record_count:,} vehicle records ready for processing.")
+
+    write_processed_local(clean_df, local_out)
+    spark.stop()
+
+    print("Uploading processed Parquet to Azure...")
+    upload_to_azure(local_out, conn_str, PROC_CONTAINER)
+    print(" Pipeline complete!")
+
+
+if __name__ == "__main__":
+    # Parse AccountName and AccountKey from the connection string
+    _account_name = None
+    _account_key  = None
+    if AZURE_CONN_STR:
+        for part in AZURE_CONN_STR.split(";"):
+            if part.startswith("AccountName="):
+                _account_name = part.split("=", 1)[1]
+            elif part.startswith("AccountKey="):
+                _account_key = part.split("=", 1)[1]
+
+    if not _account_name or not _account_key:
+        raise EnvironmentError(
+            "AZURE_STORAGE_CONNECTION_STRING is not set or missing AccountName/AccountKey."
+        )
+
+    # Read from Azure via Spark (wasbs://), write locally, then upload via SDK
+    RAW_PATH  = f"wasbs://{RAW_CONTAINER}@{_account_name}.blob.core.windows.net/*.json"
+    LOCAL_OUT = os.path.join(
+        os.path.dirname(__file__), "..", "..", "data", "processed", "vehicles"
+    )
+
+    run_transform(RAW_PATH, LOCAL_OUT, AZURE_CONN_STR, _account_name, _account_key)
