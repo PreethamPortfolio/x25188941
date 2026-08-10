@@ -3,6 +3,8 @@ import yaml
 from dotenv import load_dotenv
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.functions import col, when, round, count, max as spark_max, lit, hour, avg
+from pyspark.sql.window import Window
 from pyspark.sql.types import DoubleType, LongType
 
 
@@ -29,7 +31,7 @@ def get_spark(account_name: str, account_key: str) -> SparkSession:
     return (
         SparkSession.builder
         .appName(spark_cfg.get("app_name", "TransitGridPipeline"))
-        .config("spark.jars.packages", "org.apache.hadoop:hadoop-azure:3.3.4,com.microsoft.azure:azure-storage:8.6.6")
+        .config("spark.jars.packages", "org.apache.hadoop:hadoop-azure:3.3.4,com.microsoft.azure:azure-storage:8.6.6,org.postgresql:postgresql:42.7.1")
         .config("spark.executor.memory", spark_cfg.get("executor_memory", "2g"))
         .config("spark.driver.memory",   spark_cfg.get("driver_memory",   "2g"))
         # Inject Azure storage account credentials so hadoop-azure can authenticate
@@ -158,7 +160,83 @@ def flatten_transit_data(raw_df):
 
 
 
-# 5. Write transformed data — local Parquet then upload to Azure
+# 5. Analytics (Trust & Soft Labels)
+
+def process_distributed_analytics(df):
+    """Executes Data Trust and Soft Labeling within the Spark DAG."""
+    print("Calculating Distributed Trust Scores...")
+    
+    # --- 1. DATA TRUST PIPELINE ---
+    # Base score of 1.0
+    df = df.withColumn("trust_score", lit(1.0))
+    
+    # Rule A: Zeroed coordinates penalty (-0.3)
+    df = df.withColumn("trust_score", 
+                       when((col("latitude") == 0) | (col("longitude") == 0), col("trust_score") - 0.3)
+                       .otherwise(col("trust_score")))
+                       
+    # Rule B: Missing or negative speed penalty (-0.2)
+    df = df.withColumn("trust_score", 
+                       when(col("speed_kmh").isNull() | (col("speed_kmh") < 0), col("trust_score") - 0.2)
+                       .otherwise(col("trust_score")))
+                       
+    # Rule C: Missing bearing penalty (-0.1)
+    df = df.withColumn("trust_score", 
+                       when(col("bearing").isNull(), col("trust_score") - 0.1)
+                       .otherwise(col("trust_score")))
+
+    # --- 2. SOFT LABEL PIPELINE ---
+    print("Calculating Distributed Soft Labels (EV Viability)...")
+    
+    # Extract hour of day for the time slider
+    df = df.withColumn("hour_of_day", hour(col("vehicle_datetime")))
+    
+    # Create ~110m geographic bins
+    df = df.withColumn("cluster_lat", round(col("latitude"), 3))
+    df = df.withColumn("cluster_lon", round(col("longitude"), 3))
+    
+    # Calculate vehicle density per cluster AND hour using a Window partition
+    cluster_window = Window.partitionBy("cluster_lat", "cluster_lon", "hour_of_day")
+    df = df.withColumn("density", count("vehicle_id").over(cluster_window))
+    
+    # Calculate max density globally to normalize the score (0.0 to 1.0)
+    global_window = Window.partitionBy(lit(1))
+    df = df.withColumn("max_density", spark_max("density").over(global_window))
+    
+    df = df.withColumn("normalized_density", 
+                       when(col("max_density") > 0, col("density") / col("max_density"))
+                       .otherwise(0))
+                       
+    # Calculate Final Viability Probability (70% Density, 30% Trust)
+    df = df.withColumn("ev_viability_prob", (col("normalized_density") * 0.7) + (col("trust_score") * 0.3))
+    
+    # Cap the probability at 1.0 (100%)
+    df = df.withColumn("ev_viability_prob", 
+                       when(col("ev_viability_prob") > 1.0, 1.0)
+                       .otherwise(col("ev_viability_prob")))
+                       
+    # Clean up temporary calculation columns
+    df = df.drop("max_density")
+    
+    return df
+
+def process_traffic_bottlenecks(df):
+    """Calculates average speeds and vehicle counts per geographic cluster."""
+    print("Calculating Traffic Bottlenecks...")
+    return df.groupBy("cluster_lat", "cluster_lon").agg(
+        round(avg("speed_kmh"), 2).alias("avg_speed_kmh"),
+        count("vehicle_id").alias("vehicle_count")
+    )
+
+def process_fleet_density(df):
+    """Calculates total active transit vehicles grouped by hour of the day."""
+    print("Calculating Hourly Fleet Density...")
+    return df.groupBy("hour_of_day").agg(
+        count("vehicle_id").alias("total_active_vehicles")
+    )
+
+
+# 6. Write transformed data — local Parquet then upload to Azure
 
 def write_processed_local(df, local_path: str, mode: str = "append"):
     """
@@ -215,20 +293,28 @@ def upload_to_azure(local_path: str, conn_str: str, container: str, prefix: str 
 
 
 
+def write_to_postgres(df, table_name, jdbc_url, user, password):
+    """Helper function to append a PySpark DataFrame to a PostgreSQL table."""
+    try:
+        df.write \
+            .format("jdbc") \
+            .option("url", jdbc_url) \
+            .option("dbtable", table_name) \
+            .option("user", user) \
+            .option("password", password) \
+            .option("driver", "org.postgresql.Driver") \
+            .mode("append") \
+            .save()
+    except Exception as e:
+        print(f"ERROR writing to PostgreSQL table {table_name}: {e}")
+
 # 6. Main ETL entrypoint
 
 def run_transform(raw_path: str, local_out: str, conn_str: str,
                   account_name: str, account_key: str):
     """
     Full ETL pipeline:
-        raw Azure JSON  ->  flatten / clean  ->  local Parquet  ->  Azure upload.
-
-    Args:
-        raw_path:     wasbs:// path to the raw-transit container.
-        local_out:    Local directory to write intermediate Parquet files.
-        conn_str:     Azure storage connection string (for SDK upload).
-        account_name: Azure storage account name (for Spark read auth).
-        account_key:  Azure storage account key  (for Spark read auth).
+        raw Azure JSON  ->  flatten / clean  ->  distributed analytics  ->  PostgreSQL.
     """
     spark = get_spark(account_name, account_key)
     print(f"Reading raw data from: {raw_path}")
@@ -241,12 +327,34 @@ def run_transform(raw_path: str, local_out: str, conn_str: str,
     record_count = clean_df.count()
     print(f" {record_count:,} vehicle records ready for processing.")
 
-    write_processed_local(clean_df, local_out)
+    # 1. Compute Base Hubs and Soft Labels
+    analyzed_df = process_distributed_analytics(clean_df)
+    
+    # 2. Compute the new analytical tables
+    bottlenecks_df = process_traffic_bottlenecks(analyzed_df)
+    fleet_df = process_fleet_density(analyzed_df)
+    
+    # WRITE DIRECTLY TO POSTGRESQL
+    DB_HOST = os.getenv("DB_HOST", "localhost")
+    DB_PORT = os.getenv("DB_PORT", "5432")
+    DB_NAME = os.getenv("DB_NAME", "transit_db")
+    DB_USER = os.getenv("DB_USER", "postgres")
+    DB_PASSWORD = os.getenv("DB_PASSWORD")
+    
+    jdbc_url = f"jdbc:postgresql://{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    
+    print(f"Writing {analyzed_df.count()} analyzed records directly to PostgreSQL...")
+    write_to_postgres(analyzed_df, "ev_viability_hubs", jdbc_url, DB_USER, DB_PASSWORD)
+    
+    print(f"Writing {bottlenecks_df.count()} bottleneck records to PostgreSQL...")
+    write_to_postgres(bottlenecks_df, "traffic_bottlenecks", jdbc_url, DB_USER, DB_PASSWORD)
+    
+    print(f"Writing {fleet_df.count()} fleet density records to PostgreSQL...")
+    write_to_postgres(fleet_df, "fleet_density_hourly", jdbc_url, DB_USER, DB_PASSWORD)
+    
+    print("SUCCESS: All analytical datasets securely loaded into PostgreSQL")
+        
     spark.stop()
-
-    print("Uploading processed Parquet to Azure...")
-    upload_to_azure(local_out, conn_str, PROC_CONTAINER)
-    print(" Pipeline complete!")
 
 
 if __name__ == "__main__":
@@ -268,7 +376,7 @@ if __name__ == "__main__":
     # Read from Azure via Spark (wasbs://), write locally, then upload via SDK
     RAW_PATH  = f"wasbs://{RAW_CONTAINER}@{_account_name}.blob.core.windows.net/*.json"
     LOCAL_OUT = os.path.join(
-        os.path.dirname(__file__), "..", "..", "data", "processed", "vehicles"
+        os.path.dirname(__file__), "..", "..", "data", "processed", "spark_analytics"
     )
 
     run_transform(RAW_PATH, LOCAL_OUT, AZURE_CONN_STR, _account_name, _account_key)
