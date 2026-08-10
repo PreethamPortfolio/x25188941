@@ -1,27 +1,12 @@
 #!/bin/bash
-# MASTER SCRIPT: Automates the entire ETL workflow
-# Usage: bash run_pipeline.sh
+echo "Starting Distributed Processing Pipeline for Irish Transit Data..."
 
-set -e  # Exit immediately if any command fails
+echo "Step 1: Ingesting Live Data (10,000+ Record Loop)..."
+python src/ingestion/ingestion_loop.py
 
-echo "=============================================="
-echo " Starting Irish Transit Data Pipeline"
-echo "=============================================="
-
-echo ""
-echo "Step 1: Ingesting Live NTA Data..."
-python src/ingestion/transit_ingestion.py
-
-echo ""
-echo "Step 2: Processing via PySpark..."
+echo "Step 2: Processing via PySpark and Loading to PostgreSQL..."
 python src/processing/spark_transform.py
 
-echo ""
-echo "Step 3: Loading Data to PostgreSQL..."
-python src/database/db_loader.py
+echo "Pipeline execution complete. Data is ready for Analytics."
 
-echo ""
-echo "=============================================="
-echo " Pipeline execution complete."
-echo " Data is ready for EV Analytics."
-echo "=============================================="
+

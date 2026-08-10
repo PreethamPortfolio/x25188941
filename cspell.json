@@ -4,6 +4,7 @@
     "ignorePaths": [
         "readme.txt",
         "requirements.txt",
-        "src/processing/spark_transform.py"
+        "src/processing/spark_transform.py",
+        "src/ingestion/fetch_eirgrid.py"
     ]
 }
