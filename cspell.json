@@ -5,6 +5,13 @@
         "readme.txt",
         "requirements.txt",
         "src/processing/spark_transform.py",
-        "src/ingestion/fetch_eirgrid.py"
+        "src/ingestion/fetch_eirgrid.py",
+        "src/ingestion/transit_ingestion.py",
+        "src/ingestion/ingestion_loop.py",
+        "run_pipeline.sh"
+    ],
+    "words": [
+        "eirgrid",
+        "pycache"
     ]
 }
