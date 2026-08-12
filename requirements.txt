@@ -8,3 +8,5 @@ pandas
 sqlalchemy
 pyarrow
 fastparquet
+gtfs-realtime-bindings
+protobuf

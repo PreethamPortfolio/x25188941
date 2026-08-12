@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        "./src/ingestion"
+    ],
+    "python.defaultInterpreterPath": "venv/Scripts/python.exe"
+}
